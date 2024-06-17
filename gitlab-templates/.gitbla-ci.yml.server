@@ -1,0 +1,131 @@
+default:
+  image: ubuntu:20.04
+
+variables:
+  STAGE_SERVER: "192.168.2.6"
+  LIVE_SERVER: "192.168.2.6"
+  DEPLOYMENT_PATH: "/var/www"
+  STAGE_PATH: "/var/www/html"
+  LIVE_PATH: "/var/www/html"
+
+stages:
+  - deploy_stage
+  - deploy_live
+  - schedule_restart_all
+
+before_script:
+  - export DEBIAN_FRONTEND="noninteractive"
+  - apt-get update -y -q > /dev/null
+  - apt-get install apt-utils -y -q > /dev/null
+  - apt-get dist-upgrade -y -q > /dev/null
+  - apt-get install ssh rsync curl zip unzip git -y -q > /dev/null
+  - apt-get install php php-curl php-gd php-xml php-zip php-mbstring -y -q > /dev/null
+  - curl -sS http://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+  # Rollback to version 1 when drupal version 7
+  - composer self-update --1
+  # Install core and contrib modules/themes
+  - composer install
+  # config ssh and key
+  - mkdir -p ~/.ssh
+  - echo "Host 192.168.2.*" > ~/.ssh/config
+  - echo "  User ubuntu" >> ~/.ssh/config
+  - touch  ~/.ssh/Keyfile.pem
+  - echo ${SSH_OTC_KEY_BASE64} | base64 --decode > ~/.ssh/Keyfile.pem
+  - chmod 600 ~/.ssh/Keyfile.pem
+  - echo "  IdentityFile ~/.ssh/Keyfile.pem" >> ~/.ssh/config
+  - ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
+  - ssh-keyscan ${LIVE_SERVER} >> ~/.ssh/known_hosts
+
+restart_all:
+  stage: schedule_restart_all
+  only:
+    - schedules
+  script:
+    # Restart Cron-Data
+    - ssh ${LIVE_SERVER} "sudo shutdown -r 1"
+
+deploy_stage_server:
+  stage: deploy_stage
+  only:
+    - master
+  except:
+    - schedules
+  environment:
+    name: stage
+    url: https://url.mvms.de
+  script:
+    # Create new directory and copy config files
+    - ssh ${STAGE_SERVER} "sudo timedatectl set-timezone Europe/Berlin"
+    - ssh ${STAGE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/stage_new ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/stage_new; fi"
+    - ssh ${STAGE_SERVER} "mkdir -p ${DEPLOYMENT_PATH}/stage_new"
+    - rsync -az ./ ${STAGE_SERVER}:${DEPLOYMENT_PATH}/stage_new
+    # create Sym-Link for file system
+    - ssh ${STAGE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/stage_new/web/sites/default/files ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/stage_new/web/sites/default/files; fi"
+    - ssh ${STAGE_SERVER} "ln -sf ${DEPLOYMENT_PATH}/files_stage ${DEPLOYMENT_PATH}/stage_new/web/sites/default/files"
+    # copy local setting file
+    - ssh ${STAGE_SERVER} "cp ${DEPLOYMENT_PATH}/stage_new/ci/server/stage/settings.local.php ${DEPLOYMENT_PATH}/stage_new/web/sites/default/settings.local.php"
+    - ssh ${STAGE_SERVER} "cd ${DEPLOYMENT_PATH}/stage_new && composer install"
+    - ssh ${STAGE_SERVER} "sudo chown -R www-data:www-data ${DEPLOYMENT_PATH}/stage_new/web ${DEPLOYMENT_PATH}/stage_new/vendor"
+    - ssh ${STAGE_SERVER} "sudo chmod o-w ${DEPLOYMENT_PATH}/stage_new/web/sites/default/ && sudo chmod o-w ${DEPLOYMENT_PATH}/stage_new/web/sites/default/*.php"
+    - ssh ${STAGE_SERVER} "sudo chmod 444 ${DEPLOYMENT_PATH}/stage_new/web/sites/default/settings.local.php ${DEPLOYMENT_PATH}/stage_new/web/sites/default/settings.php"
+    # Create DB dump
+    - export DRUSH_EXECUTABLE="${DEPLOYMENT_PATH}/stage_new/vendor/bin/drush"
+    - ssh ${STAGE_SERVER} "if [[ ! -e ${DRUSH_EXECUTABLE} ]]; then exit 1; fi"
+    - export DRUSH="${DRUSH_EXECUTABLE} --root=${STAGE_PATH}/web"
+    - ssh ${STAGE_SERVER} "${DRUSH} sql-dump > ${STAGE_PATH}/backups/${CI_COMMIT_SHORT_SHA}.sql"
+    # Remove folders
+    - ssh ${STAGE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/stage_new/.docksal ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/stage_new/.docksal; fi"
+    - ssh ${STAGE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/stage_new/.git ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/stage_new/.git; fi"
+    - ssh ${STAGE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/stage_new/ci ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/stage_new/ci; fi"
+    - ssh ${STAGE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/stage_new/docs ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/stage_new/docs; fi"
+    # move live to last
+    - ssh ${STAGE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/stage_last ]]; then sudo rm -r ${DEPLOYMENT_PATH}/stage_last; fi"
+    - ssh ${STAGE_SERVER} "sudo mv ${STAGE_PATH} ${DEPLOYMENT_PATH}/stage_last && sudo mv ${DEPLOYMENT_PATH}/stage_new ${STAGE_PATH}"
+    # db update
+    - export DRUSH_EXECUTABLE="${STAGE_PATH}/vendor/bin/drush"
+    - export DRUSH="${DRUSH_EXECUTABLE} --root=${STAGE_PATH}/web"
+    - ssh ${STAGE_SERVER} "${DRUSH} cc drush"
+    - ssh ${STAGE_SERVER} "${DRUSH} updb -y"
+
+deploy_live_server:
+  stage: deploy_live
+  only:
+    - tags
+  except:
+    - schedules
+  environment:
+    name: live
+    url: https://www.fussball-knabenturnier.de
+  script:
+    # Create new directory and copy config files
+    - ssh ${LIVE_SERVER} "sudo timedatectl set-timezone Europe/Berlin"
+    - ssh ${LIVE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/new ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/new; fi"
+    - ssh ${LIVE_SERVER} "mkdir -p ${DEPLOYMENT_PATH}/new"
+    - rsync -az ./ ${LIVE_SERVER}:${DEPLOYMENT_PATH}/new
+    # create Sym-Link for file system
+    - ssh ${LIVE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/new/web/sites/default/files ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/new/web/sites/default/files; fi"
+    - ssh ${LIVE_SERVER} "ln -sf ${DEPLOYMENT_PATH}/files ${DEPLOYMENT_PATH}/new/web/sites/default/files"
+    # copy local setting file
+    - ssh ${LIVE_SERVER} "cp ${DEPLOYMENT_PATH}/new/ci/server/live/settings.local.php ${DEPLOYMENT_PATH}/new/web/sites/default/settings.local.php"
+    - ssh ${LIVE_SERVER} "cd ${DEPLOYMENT_PATH}/new && composer install"
+    - ssh ${LIVE_SERVER} "sudo chown -R www-data:www-data ${DEPLOYMENT_PATH}/new/web ${DEPLOYMENT_PATH}/new/vendor"
+    - ssh ${LIVE_SERVER} "sudo chmod o-w ${DEPLOYMENT_PATH}/new/web/sites/default/ && sudo chmod o-w ${DEPLOYMENT_PATH}/new/web/sites/default/*.php"
+    - ssh ${LIVE_SERVER} "sudo chmod 444 ${DEPLOYMENT_PATH}/new/web/sites/default/settings.local.php ${DEPLOYMENT_PATH}/new/web/sites/default/settings.php"
+    # Create DB dump
+    - export DRUSH_EXECUTABLE="${DEPLOYMENT_PATH}/new/vendor/bin/drush"
+    - ssh ${LIVE_SERVER} "if [[ ! -e ${DRUSH_EXECUTABLE} ]]; then exit 1; fi"
+    - export DRUSH="${DRUSH_EXECUTABLE} --root=${LIVE_PATH}/web"
+    - ssh ${LIVE_SERVER} "${DRUSH} sql-dump > ${LIVE_PATH}/backups/${CI_COMMIT_SHORT_SHA}.sql"
+    # Remove folders
+    - ssh ${LIVE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/new/.docksal ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/new/.docksal; fi"
+    - ssh ${LIVE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/new/.git ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/new/.git; fi"
+    - ssh ${LIVE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/new/ci ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/new/ci; fi"
+    - ssh ${LIVE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/new/docs ]]; then sudo rm -rf ${DEPLOYMENT_PATH}/new/docs; fi"
+    # move live to last
+    - ssh ${LIVE_SERVER} "if [[ -e ${DEPLOYMENT_PATH}/last ]]; then sudo rm -r ${DEPLOYMENT_PATH}/last; fi"
+    - ssh ${LIVE_SERVER} "sudo mv ${LIVE_PATH} ${DEPLOYMENT_PATH}/last && sudo mv ${DEPLOYMENT_PATH}/new ${LIVE_PATH}"
+    # db update
+    - export DRUSH_EXECUTABLE="${LIVE_PATH}/vendor/bin/drush"
+    - export DRUSH="${DRUSH_EXECUTABLE} --root=${LIVE_PATH}/web"
+    - ssh ${LIVE_SERVER} "${DRUSH} cc drush"
+    - ssh ${LIVE_SERVER} "${DRUSH} updb -y"
